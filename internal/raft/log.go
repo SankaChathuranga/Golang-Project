@@ -69,9 +69,12 @@ func (l *boltLog) Append(entries ...LogEntry) int {
 			last = uint64(l.LastIndex() + 1)
 			var buf bytes.Buffer
 			_ = gob.NewEncoder(&buf).Encode(e)
-			_ = b.Put(u64ToKey(last), buf.Bytes())
+			if err := b.Put(u64ToKey(last), buf.Bytes()); err != nil {
+				return err
+			}
 		}
-		return nil
+		// Ensure the update is persisted
+		return tx.Commit()
 	})
 	return int(last)
 }
@@ -126,12 +129,26 @@ func (l *boltLog) TruncateBefore(index int) {
 
 	_ = l.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("log"))
+		meta := tx.Bucket([]byte("meta"))
 		c := b.Cursor()
+
+		// Delete all entries before the cutoff
 		for k, _ := c.First(); k != nil && keyToU64(k) < uint64(index); k, _ = c.Next() {
-			_ = c.Delete()
+			if err := c.Delete(); err != nil {
+				return err
+			}
 		}
 
-		return nil
+		// Update the base index
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(index))
+		if err := meta.Put([]byte("firstIndex"), buf[:]); err != nil {
+			return err
+		}
+		l.base = uint64(index)
+
+		// Ensure the update is persisted
+		return tx.Commit()
 	})
 }
 
@@ -146,6 +163,7 @@ func (l *boltLog) TruncateSuffix(idx int) error {
 				return err
 			}
 		}
-		return nil
+		// Ensure the update is persisted
+		return tx.Commit()
 	})
 }

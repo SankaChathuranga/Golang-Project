@@ -80,6 +80,9 @@ func NewNode(id string, peers map[string]string, applyCh chan ApplyMsg, db *bolt
 	n.votedFor = n.store.VotedFor()
 	n.lastApplied = n.store.LastApplied()
 
+	// Initialize commitIndex to lastApplied to prevent replay of old entries
+	n.commitIndex = n.lastApplied
+
 	n.resetElectionTimer()
 	n.trans = transport.New(n.handleInbound)
 	return n
@@ -193,17 +196,25 @@ func (n *Node) resetElectionTimer() {
 func (n *Node) startElection() {
 	// step up to candidate & bump term
 	n.mu.Lock()
-	n.state = Candidate
-
 	n.currentTerm++
-	n.store.SetTerm(n.currentTerm)
-
+	if err := n.store.SetTerm(n.currentTerm); err != nil {
+		n.logger.Printf("failed to set term: %v", err)
+	}
+	n.state = Candidate
 	n.votedFor = n.id
-	n.store.SetVotedFor(n.id)
-
+	if err := n.store.SetVotedFor(n.id); err != nil {
+		n.logger.Printf("failed to set vote: %v", err)
+	}
 	term := n.currentTerm
 	lastIdx, lastTerm := n.log.LastIndexTerm()
 	n.resetElectionTimer()
+
+	// Special case: single node cluster
+	if len(n.peers) == 0 {
+		n.becomeLeader()
+		n.mu.Unlock()
+		return
+	}
 
 	// copy peers map so we can iterate after releasing the lock
 	peerAddrs := make(map[string]string, len(n.peers))
@@ -216,6 +227,8 @@ func (n *Node) startElection() {
 
 	var votes int32 = 1 // self-vote
 	var wg sync.WaitGroup
+	var highestTerm int32 = int32(term)
+	var voteCh = make(chan bool, len(peerAddrs))
 
 	for pid, paddr := range peerAddrs {
 		wg.Add(1)
@@ -224,26 +237,41 @@ func (n *Node) startElection() {
 			args := RequestVoteArgs{Term: term, CandidateID: n.id, LastLogIndex: lastIdx, LastLogTerm: lastTerm}
 			var reply RequestVoteReply
 			if err := n.trans.Call(addr, transport.RPCRequestVote, &args, &reply); err != nil {
+				n.logger.Printf("failed to request vote from %s: %v", id, err)
 				return
 			}
 			if reply.Term > term {
+				atomic.StoreInt32(&highestTerm, int32(reply.Term))
 				n.mu.Lock()
 				n.becomeFollower(reply.Term)
 				n.mu.Unlock()
 				return
 			}
 			if reply.VoteGranted && reply.Term == term {
-				if atomic.AddInt32(&votes, 1) > int32(len(n.peers)/2) {
-					n.mu.Lock()
-					if n.state == Candidate && n.currentTerm == term {
-						n.becomeLeader()
-					}
-					n.mu.Unlock()
-				}
+				voteCh <- true
 			}
 		}(pid, paddr)
 	}
-	wg.Wait()
+
+	// Wait for votes with timeout
+	go func() {
+		wg.Wait()
+		close(voteCh)
+	}()
+
+	// Count votes
+	for vote := range voteCh {
+		if vote {
+			if atomic.AddInt32(&votes, 1) > int32((len(n.peers)+1)/2) {
+				n.mu.Lock()
+				if n.state == Candidate && n.currentTerm == term && atomic.LoadInt32(&highestTerm) == int32(term) {
+					n.becomeLeader()
+				}
+				n.mu.Unlock()
+				return
+			}
+		}
+	}
 }
 
 // ------------------------------------------------------------
@@ -254,10 +282,14 @@ func (n *Node) becomeFollower(term int) {
 	n.state = Follower
 
 	n.currentTerm = term
-	n.store.SetTerm(term)
+	if err := n.store.SetTerm(term); err != nil {
+		n.logger.Printf("failed to set term: %v", err)
+	}
 
 	n.votedFor = ""
-	n.store.SetVotedFor("")
+	if err := n.store.SetVotedFor(""); err != nil {
+		n.logger.Printf("failed to clear vote: %v", err)
+	}
 
 	n.resetElectionTimer()
 }
@@ -279,7 +311,7 @@ func (n *Node) becomeLeader() {
 }
 
 func (n *Node) broadcastAppendEntries() {
-	// capture a *snapshot* of leader’s state under read-lock
+	// capture a *snapshot* of leader's state under read-lock
 	n.mu.RLock()
 	if n.state != Leader {
 		n.mu.RUnlock()
@@ -335,8 +367,14 @@ func (n *Node) handleAppendEntriesReply(peerID string, reply *AppendEntriesReply
 		return
 	}
 	if !reply.Success {
+		// Optimistic backoff: if we're far behind, jump back more aggressively
 		if n.nextIndex[peerID] > 1 {
-			n.nextIndex[peerID]--
+			// If we're very far behind, jump back more aggressively
+			if n.nextIndex[peerID]-n.matchIndex[peerID] > 100 {
+				n.nextIndex[peerID] = n.matchIndex[peerID] + 1
+			} else {
+				n.nextIndex[peerID]--
+			}
 		}
 		return
 	}
@@ -345,15 +383,20 @@ func (n *Node) handleAppendEntriesReply(peerID string, reply *AppendEntriesReply
 	n.nextIndex[peerID] = n.log.LastIndex() + 1
 	n.matchIndex[peerID] = n.log.LastIndex()
 
+	// Try to advance commitIndex
 	advanced := false
 	for i := n.commitIndex + 1; i <= n.log.LastIndex(); i++ {
+		// Only commit entries from current term
+		if e, ok := n.log.At(i); !ok || e.Term != n.currentTerm {
+			continue
+		}
 		replicated := 1 // self
 		for id := range n.peers {
 			if id != n.id && n.matchIndex[id] >= i {
 				replicated++
 			}
 		}
-		if replicated > len(n.peers)/2 {
+		if replicated > (len(n.peers)+1)/2 {
 			n.commitIndex = i
 			advanced = true
 		}
@@ -387,7 +430,9 @@ func (n *Node) onRequestVote(args *RequestVoteArgs) RequestVoteReply {
 		grant = true
 
 		n.votedFor = args.CandidateID
-		n.store.SetVotedFor(args.CandidateID)
+		if err := n.store.SetVotedFor(args.CandidateID); err != nil {
+			n.logger.Printf("failed to set vote: %v", err)
+		}
 
 		n.resetElectionTimer()
 	}
@@ -426,19 +471,30 @@ func (n *Node) onAppendEntries(args *AppendEntriesArgs) AppendEntriesReply {
 			if err != nil {
 				panic(err)
 			}
-			n.log.Append(entry)
+			// Append all remaining entries
+			for j := i; j < len(args.Entries); j++ {
+				n.log.Append(args.Entries[j])
+			}
+			break
 		}
 	}
 
+	// Update commit index and apply entries
 	if args.LeaderCommit > n.commitIndex {
 		n.commitIndex = min_(args.LeaderCommit, n.log.LastIndex())
-	}
-	for n.lastApplied < n.commitIndex {
-		n.lastApplied++
-		if _, ok := n.log.At(n.lastApplied); ok {
-			n.store.SetLastApplied(n.lastApplied)
+		// Apply all newly committed entries immediately
+		for n.lastApplied < n.commitIndex {
+			n.lastApplied++
+			if e, ok := n.log.At(n.lastApplied); ok {
+				n.applyCh <- ApplyMsg{CommandValid: true, Command: e.Command,
+					CommandIndex: n.lastApplied}
+				if err := n.store.SetLastApplied(n.lastApplied); err != nil {
+					n.logger.Printf("failed to set last applied: %v", err)
+				}
+			}
 		}
 	}
+
 	n.maybePrune()
 
 	return AppendEntriesReply{Term: n.currentTerm, Success: true}
@@ -459,7 +515,9 @@ func (n *Node) applyCommitted() {
 		if e, ok := n.log.At(n.lastApplied); ok {
 			n.applyCh <- ApplyMsg{CommandValid: true, Command: e.Command,
 				CommandIndex: n.lastApplied}
-			n.store.SetLastApplied(n.lastApplied)
+			if err := n.store.SetLastApplied(n.lastApplied); err != nil {
+				n.logger.Printf("failed to set last applied: %v", err)
+			}
 		}
 	}
 }
