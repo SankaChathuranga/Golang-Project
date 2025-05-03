@@ -38,7 +38,10 @@ func main() {
 	}
 	store := kv.New(db, 20)
 	applyCh := make(chan raft.ApplyMsg, 64)
-	node := raft.NewNode(*id, peers, applyCh, db)
+	node, err := raft.NewNode(*id, peers, applyCh, db)
+	if err != nil {
+		log.Fatalf("failed to create node: %v", err)
+	}
 
 	go func() { // apply committed commands
 		for msg := range applyCh {

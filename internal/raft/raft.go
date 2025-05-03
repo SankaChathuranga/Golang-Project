@@ -3,6 +3,7 @@ package raft
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"sync"
@@ -57,35 +58,56 @@ type Node struct {
 	heartbeatTimer *time.Timer
 	applyCh        chan ApplyMsg
 	stopCh         chan struct{}
+	logger         *log.Logger
 
 	// transport
 	trans *transport.HTTPTransport
 }
 
-func NewNode(id string, peers map[string]string, applyCh chan ApplyMsg, db *bolt.DB) *Node {
+func NewNode(id string, peers map[string]string, applyCh chan ApplyMsg, db *bolt.DB) (*Node, error) {
+	store, err := NewBoltStore(db)
+	if err != nil {
+		return nil, err
+	}
+
 	n := &Node{
 		id:         id,
 		peers:      peers,
 		db:         db,
 		log:        NewBoltLog(db),
-		store:      NewBoltStore(db),
+		store:      store,
 		state:      Follower,
 		applyCh:    applyCh,
 		stopCh:     make(chan struct{}),
 		nextIndex:  make(map[string]int),
 		matchIndex: make(map[string]int),
+		logger:     log.New(log.Writer(), "[RAFT] ", log.LstdFlags),
 	}
 
-	n.currentTerm = n.store.Term()
-	n.votedFor = n.store.VotedFor()
-	n.lastApplied = n.store.LastApplied()
+	term, err := n.store.Term()
+	if err != nil {
+		return nil, err
+	}
+	n.currentTerm = term
+
+	votedFor, err := n.store.VotedFor()
+	if err != nil {
+		return nil, err
+	}
+	n.votedFor = votedFor
+
+	lastApplied, err := n.store.LastApplied()
+	if err != nil {
+		return nil, err
+	}
+	n.lastApplied = lastApplied
 
 	// Initialize commitIndex to lastApplied to prevent replay of old entries
 	n.commitIndex = n.lastApplied
 
 	n.resetElectionTimer()
 	n.trans = transport.New(n.handleInbound)
-	return n
+	return n, nil
 }
 
 // ------------------------------------------------------------
@@ -100,6 +122,19 @@ func (n *Node) Serve(addr string) error {
 
 func (n *Node) Start() {
 	go n.ticker()
+	go func() {
+		addr := n.peers[n.id]
+		if addr == "" {
+			n.logger.Printf("node %s has no address configured", n.id)
+			return
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/", n.trans)
+		svr := &http.Server{Addr: addr, Handler: mux}
+		if err := svr.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			n.logger.Printf("HTTP server error: %v", err)
+		}
+	}()
 }
 
 func (n *Node) Stop() { close(n.stopCh) }
@@ -181,12 +216,15 @@ func (n *Node) heartbeatTimerC() <-chan time.Time {
 }
 
 func (n *Node) resetElectionTimer() {
-	d := time.Duration(rand.Intn(int(config.ElectionTimeoutMax-config.ElectionTimeoutMin))) + config.ElectionTimeoutMin
 	if n.electionTimer == nil {
-		n.electionTimer = time.NewTimer(d)
+		n.electionTimer = time.NewTimer(randomElectionTimeout())
 	} else {
-		n.electionTimer.Reset(d)
+		n.electionTimer.Reset(randomElectionTimeout())
 	}
+}
+
+func randomElectionTimeout() time.Duration {
+	return time.Duration(150+rand.Intn(150)) * time.Millisecond
 }
 
 // ------------------------------------------------------------

@@ -84,7 +84,10 @@ func TestLeaderRestartWithDisk(t *testing.T) {
 	db, _ := bolt.Open(dbPath, 0600, nil)
 
 	applyCh := make(chan raft.ApplyMsg, 128)
-	node := raft.NewNode("solo", nil, applyCh, db)
+	node, err := raft.NewNode("solo", nil, applyCh, db)
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
 	go node.Start()
 
 	// --- wait for self-election -----------------------
@@ -114,7 +117,10 @@ func TestLeaderRestartWithDisk(t *testing.T) {
 	// ---------- restart -------------------------------
 	db2, _ := bolt.Open(dbPath, 0600, nil)
 	applyCh2 := make(chan raft.ApplyMsg, 128)
-	node2 := raft.NewNode("solo", nil, applyCh2, db2)
+	node2, err := raft.NewNode("solo", nil, applyCh2, db2)
+	if err != nil {
+		t.Fatalf("failed to create node2: %v", err)
+	}
 	go node2.Start()
 
 	waitLeader(node2, 500*time.Millisecond)
@@ -175,7 +181,10 @@ func restartNode(t *testing.T, old *raft.Node) *raft.Node {
 	}(old.ApplyCh())
 
 	newCh := make(chan raft.ApplyMsg, 256)
-	newN := raft.NewNode(old.ID(), old.PeersCopy(), newCh, old.GetDB())
+	newN, err := raft.NewNode(old.ID(), old.PeersCopy(), newCh, old.GetDB())
+	if err != nil {
+		t.Fatalf("failed to create new node: %v", err)
+	}
 	go newN.Start()
 	return newN
 }

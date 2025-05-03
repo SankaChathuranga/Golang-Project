@@ -67,7 +67,10 @@ func buildCluster(t *testing.T, n int) ([]*raft.Node, func()) {
 
 		// raft node ---------------------------------------------------
 		applyCh := make(chan raft.ApplyMsg, 128)
-		node := raft.NewNode(id, peers, applyCh, db)
+		node, err := raft.NewNode(id, peers, applyCh, db)
+		if err != nil {
+			t.Fatalf("failed to create node: %v", err)
+		}
 
 		// drain applyCh so it never blocks ---------------------------
 		go func(ch <-chan raft.ApplyMsg) {

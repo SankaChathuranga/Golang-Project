@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
+	"fmt"
+	"log"
 	"sync"
 
 	bolt "go.etcd.io/bbolt"
@@ -35,26 +37,40 @@ func keyToU64(b []byte) uint64 { return binary.BigEndian.Uint64(b) }
 
 // -------------- BoltLog --------------------
 type boltLog struct {
-	db   *bolt.DB
-	mu   sync.Mutex
-	base uint64 // first index = base
+	db        *bolt.DB
+	mu        sync.Mutex
+	base      uint64 // first index = base
+	lastIndex uint64
+	logger    *log.Logger
 }
 
 func NewBoltLog(db *bolt.DB) StableLog {
-	var base uint64 = 1
-	_ = db.Update(func(tx *bolt.Tx) error {
-		_, _ = tx.CreateBucketIfNotExists([]byte("log"))
-		meta, _ := tx.CreateBucketIfNotExists([]byte("meta"))
-		if v := meta.Get([]byte("firstIndex")); v != nil {
-			base = binary.BigEndian.Uint64(v)
-		} else {
-			var b [8]byte
-			binary.BigEndian.PutUint64(b[:], base)
-			_ = meta.Put([]byte("firstIndex"), b[:])
+	l := &boltLog{
+		db:     db,
+		logger: log.New(log.Writer(), "[RAFT] ", log.LstdFlags),
+	}
+
+	// Initialize the log bucket and find the last index
+	err := db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte("log"))
+		if err != nil {
+			return err
 		}
+
+		// Find the last index
+		c := b.Cursor()
+		k, _ := c.Last()
+		if k != nil {
+			l.lastIndex = binary.BigEndian.Uint64(k)
+		}
+
 		return nil
 	})
-	return &boltLog{db: db, base: base}
+	if err != nil {
+		l.logger.Printf("failed to initialize log: %v", err)
+	}
+
+	return l
 }
 
 // --------------- StableLog interface -----------------------
@@ -63,19 +79,30 @@ func (l *boltLog) Append(entries ...LogEntry) int {
 	defer l.mu.Unlock()
 
 	var last uint64
-	_ = l.db.Update(func(tx *bolt.Tx) error {
+	err := l.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("log"))
+		if b == nil {
+			return fmt.Errorf("log bucket not found")
+		}
+
 		for _, e := range entries {
 			last = uint64(l.LastIndex() + 1)
 			var buf bytes.Buffer
-			_ = gob.NewEncoder(&buf).Encode(e)
+			if err := gob.NewEncoder(&buf).Encode(e); err != nil {
+				return err
+			}
 			if err := b.Put(u64ToKey(last), buf.Bytes()); err != nil {
 				return err
 			}
 		}
-		// Ensure the update is persisted
-		return tx.Commit()
+		return nil
 	})
+
+	if err != nil {
+		l.logger.Printf("failed to append entries: %v", err)
+		return -1
+	}
+
 	return int(last)
 }
 
@@ -147,8 +174,7 @@ func (l *boltLog) TruncateBefore(index int) {
 		}
 		l.base = uint64(index)
 
-		// Ensure the update is persisted
-		return tx.Commit()
+		return nil
 	})
 }
 
@@ -163,7 +189,6 @@ func (l *boltLog) TruncateSuffix(idx int) error {
 				return err
 			}
 		}
-		// Ensure the update is persisted
-		return tx.Commit()
+		return nil
 	})
 }
